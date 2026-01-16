@@ -1,4 +1,4 @@
-# 🐙 Octopus Deploy Terraform Service
+# 🐙 devops-terraform-services-octopusdeploy
 
 [![Build status](https://badge.buildkite.com/your-org/your-pipeline.svg?branch=main)](https://buildkite.com/your-org/your-pipeline)
 [![OpenTofu](https://img.shields.io/badge/OpenTofu-%3E%3D1.6.0-blue?logo=opentofu)](https://opentofu.org/)
