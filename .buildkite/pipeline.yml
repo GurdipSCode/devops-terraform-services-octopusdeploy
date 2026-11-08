@@ -1,3 +1,415 @@
+# Buildkite Terraform service pipeline (Windows agents, inline PowerShell)
+#
+# Repository requirements:
+#   terraform { backend "http" {} }
+#   required_version is pinned in Terraform configuration
+#   .terraform.lock.hcl is committed
+#
+# Vault KV v2 paths (each secret has a field named "value"):
+#   <mount>/data/terraform-backends/<state-id>/<environment>/username
+#   <mount>/data/terraform-backends/<state-id>/<environment>/password
+#
+# Provider authentication is intentionally provider-native. Obtain short-lived
+# provider credentials with OIDC in a protected agent hook before Terraform runs.
+
+env:
+  PROJECT_NAME: ""
+  SERVICE_NAME: "octopusdeploy"
+  TERRAFORM_STATE_ID: "octopusdeploy"
+
+  VAULT_ADDR: "https://vault.gssira.com:8200"
+  VAULT_NAMESPACE: "DevOps/Portfolio"
+  VAULT_AUTH_PATH: "jwt-buildkite"
+  VAULT_OIDC_AUDIENCE: "vault://terraform-buildkite"
+  VAULT_KV_MOUNT: "kv"
+
+  LYNX_BASE_URL: "https://lynx.gssira.com"
+
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_CLI_ARGS: "-no-color"
+  MAXIMUM_PLAN_AGE_MINUTES: "240"
+
 steps:
-  - label: ":construction: Pipeline not configured"
-    command: "echo 'Replace .buildkite/pipeline.yml with your actual build steps'"
+  - group: ":mag: Pull-request checks"
+    key: "quality-gates"
+    steps:
+      - label: ":terraform: Format"
+        key: "terraform-fmt"
+        command: "terraform fmt -check -recursive -diff"
+        agents:
+          queue: "windows-terraform-nonprod"
+        timeout_in_minutes: 10
+
+      - label: ":terraform: Validate"
+        key: "terraform-validate"
+        commands:
+          - |
+            $ErrorActionPreference = 'Stop'
+            Set-StrictMode -Version Latest
+            $dataDir = Join-Path $env:BUILDKITE_BUILD_CHECKOUT_PATH ".terraform-validate-$env:BUILDKITE_JOB_ID"
+            $env:TF_DATA_DIR = $dataDir
+            try {
+                terraform init -backend=false -input=false -lockfile=readonly -no-color
+                if ($LASTEXITCODE -ne 0) { throw 'terraform init failed.' }
+                terraform validate -no-color
+                if ($LASTEXITCODE -ne 0) { throw 'terraform validate failed.' }
+            }
+            finally {
+                Remove-Item Env:\TF_DATA_DIR -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $dataDir) {
+                    Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        agents:
+          queue: "windows-terraform-nonprod"
+        timeout_in_minutes: 15
+
+      - label: ":shield: Security and policy"
+        key: "terraform-security"
+        commands:
+          - "terraform providers lock -platform=windows_amd64 -platform=linux_amd64"
+          - "git diff --exit-code -- .terraform.lock.hcl"
+          # Replace/add your approved scanners here, for example:
+          # - "checkov --directory . --framework terraform"
+          # - "conftest test --policy policy terraform-plan.json"
+        agents:
+          queue: "windows-terraform-nonprod"
+        timeout_in_minutes: 20
+
+  # This anchor is a scalar PowerShell program, not a YAML list. Therefore apply
+  # steps do not produce the invalid nested command array from the earlier version.
+  - label: ":terraform: Plan dev"
+    key: "plan-dev"
+    depends_on: "quality-gates"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "dev"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-dev"
+      TERRAFORM_ACTION: "plan"
+      TERRAFORM_PLAN_FILE: "tfplan-dev"
+      PRODUCING_PLAN_STEP: "plan-dev"
+    command: &terraform_runner |
+      $ErrorActionPreference = 'Stop'
+      Set-StrictMode -Version Latest
+
+      function Get-RequiredVariable([string]$Name) {
+          $value = [Environment]::GetEnvironmentVariable($Name)
+          if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Required environment variable '$Name' is missing."
+          }
+          return $value.Trim()
+      }
+
+      function Invoke-JsonRequest {
+          param(
+              [Parameter(Mandatory)][string]$Uri,
+              [Parameter(Mandatory)][string]$Method,
+              [Parameter(Mandatory)][hashtable]$Headers,
+              [object]$Body
+          )
+          $request = @{ Uri = $Uri; Method = $Method; Headers = $Headers; ErrorAction = 'Stop' }
+          if ($null -ne $Body) {
+              $request.ContentType = 'application/json'
+              $request.Body = $Body | ConvertTo-Json -Depth 10 -Compress
+          }
+          Invoke-RestMethod @request
+      }
+
+      function Get-VaultKvValue([string]$Path, [hashtable]$Headers) {
+          try {
+              $response = Invoke-JsonRequest -Uri "$vaultAddress/v1/$Path" -Method GET -Headers $Headers
+          }
+          catch {
+              throw "Failed to retrieve required Vault secret '$Path'."
+          }
+          $value = [string]$response.data.data.value
+          if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Vault secret '$Path' has no non-empty 'value' field."
+          }
+          return $value
+      }
+
+      $vaultToken = $null
+      $oidcToken = $null
+      $backendUsername = $null
+      $backendPassword = $null
+      $dataDir = $null
+
+      try {
+          foreach ($name in @(
+              'PROJECT_NAME', 'SERVICE_NAME', 'TERRAFORM_STATE_ID',
+              'VAULT_ADDR', 'VAULT_NAMESPACE', 'VAULT_AUTH_PATH',
+              'VAULT_AUTH_ROLE', 'VAULT_OIDC_AUDIENCE', 'VAULT_KV_MOUNT',
+              'LYNX_BASE_URL', 'TARGET_ENVIRONMENT', 'TERRAFORM_ACTION',
+              'TERRAFORM_PLAN_FILE', 'PRODUCING_PLAN_STEP'
+          )) { Get-RequiredVariable $name | Out-Null }
+
+          $vaultAddress = $env:VAULT_ADDR.TrimEnd('/')
+          $lynxBaseUrl = $env:LYNX_BASE_URL.TrimEnd('/')
+          if (-not $vaultAddress.StartsWith('https://')) { throw 'VAULT_ADDR must use HTTPS.' }
+          if (-not $lynxBaseUrl.StartsWith('https://')) { throw 'LYNX_BASE_URL must use HTTPS.' }
+          if ($env:TARGET_ENVIRONMENT -notin @('dev', 'stg', 'prd')) { throw 'Invalid TARGET_ENVIRONMENT.' }
+          if ($env:TERRAFORM_ACTION -notin @('plan', 'apply')) { throw 'Invalid TERRAFORM_ACTION.' }
+          if ($env:TERRAFORM_STATE_ID -notmatch '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$') {
+              throw 'TERRAFORM_STATE_ID must be an immutable 3-64 character lowercase slug.'
+          }
+
+          # Apply only the exact plan from the named plan step.
+          if ($env:TERRAFORM_ACTION -eq 'apply') {
+              buildkite-agent artifact download $env:TERRAFORM_PLAN_FILE . --step $env:PRODUCING_PLAN_STEP
+              if ($LASTEXITCODE -ne 0) { throw 'Plan artifact download failed.' }
+              buildkite-agent artifact download "$env:TERRAFORM_PLAN_FILE.sha256" . --step $env:PRODUCING_PLAN_STEP
+              if ($LASTEXITCODE -ne 0) { throw 'Checksum artifact download failed.' }
+              buildkite-agent artifact download "$env:TERRAFORM_PLAN_FILE.manifest.json" . --step $env:PRODUCING_PLAN_STEP
+              if ($LASTEXITCODE -ne 0) { throw 'Plan manifest download failed.' }
+
+              $expectedHash = (Get-Content -LiteralPath "$env:TERRAFORM_PLAN_FILE.sha256" -Raw).Trim().ToLowerInvariant()
+              $actualHash = (Get-FileHash -LiteralPath $env:TERRAFORM_PLAN_FILE -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actualHash -ne $expectedHash) { throw 'Plan checksum verification failed.' }
+
+              $manifest = Get-Content -LiteralPath "$env:TERRAFORM_PLAN_FILE.manifest.json" -Raw | ConvertFrom-Json
+              if ([string]$manifest.commit -ne [string]$env:BUILDKITE_COMMIT) {
+                  throw 'The plan was produced for a different Git commit.'
+              }
+              if ([string]$manifest.environment -ne [string]$env:TARGET_ENVIRONMENT) {
+                  throw 'The plan manifest targets a different environment.'
+              }
+              if ([string]$manifest.state_id -ne [string]$env:TERRAFORM_STATE_ID) {
+                  throw 'The plan manifest targets a different state identity.'
+              }
+              $createdAt = [DateTimeOffset]::Parse([string]$manifest.created_at)
+              $maxAge = [TimeSpan]::FromMinutes([double](Get-RequiredVariable 'MAXIMUM_PLAN_AGE_MINUTES'))
+              if ([DateTimeOffset]::UtcNow - $createdAt -gt $maxAge) {
+                  throw "The saved plan is older than $($maxAge.TotalMinutes) minutes; create a new plan."
+              }
+          }
+
+          # Authenticate to Vault with an environment-specific JWT role.
+          $oidcToken = buildkite-agent oidc request-token --audience $env:VAULT_OIDC_AUDIENCE --lifetime 300
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($oidcToken)) {
+              throw 'Failed to obtain a Buildkite OIDC token.'
+          }
+          $namespaceHeaders = @{ 'X-Vault-Namespace' = $env:VAULT_NAMESPACE }
+          $login = Invoke-JsonRequest `
+              -Uri "$vaultAddress/v1/auth/$env:VAULT_AUTH_PATH/login" `
+              -Method POST `
+              -Headers $namespaceHeaders `
+              -Body @{ role = $env:VAULT_AUTH_ROLE; jwt = $oidcToken }
+          $vaultToken = [string]$login.auth.client_token
+          if ([string]::IsNullOrWhiteSpace($vaultToken)) { throw 'Vault returned no client token.' }
+          $vaultHeaders = @{
+              'X-Vault-Namespace' = $env:VAULT_NAMESPACE
+              'X-Vault-Token' = $vaultToken
+          }
+
+          $secretBase = "$env:VAULT_KV_MOUNT/data/terraform-backends/$env:TERRAFORM_STATE_ID/$env:TARGET_ENVIRONMENT"
+          $backendUsername = Get-VaultKvValue "$secretBase/username" $vaultHeaders
+          $backendPassword = Get-VaultKvValue "$secretBase/password" $vaultHeaders
+
+          $team = [Uri]::EscapeDataString($env:PROJECT_NAME)
+          $stateId = [Uri]::EscapeDataString($env:TERRAFORM_STATE_ID)
+          $environment = [Uri]::EscapeDataString($env:TARGET_ENVIRONMENT)
+          $backendBase = "$lynxBaseUrl/client/$team/$stateId/$environment"
+
+          $env:TF_HTTP_ADDRESS = "$backendBase/state"
+          $env:TF_HTTP_LOCK_ADDRESS = "$backendBase/lock"
+          $env:TF_HTTP_UNLOCK_ADDRESS = "$backendBase/unlock"
+          $env:TF_HTTP_LOCK_METHOD = 'POST'
+          $env:TF_HTTP_UNLOCK_METHOD = 'POST'
+          $env:TF_HTTP_USERNAME = $backendUsername
+          $env:TF_HTTP_PASSWORD = $backendPassword
+          $env:TF_HTTP_RETRY_MAX = '5'
+          $env:TF_HTTP_RETRY_WAIT_MIN = '2'
+          $env:TF_HTTP_RETRY_WAIT_MAX = '15'
+
+          $dataDir = Join-Path $env:BUILDKITE_BUILD_CHECKOUT_PATH ".terraform-$env:TARGET_ENVIRONMENT-$env:BUILDKITE_JOB_ID"
+          $env:TF_DATA_DIR = $dataDir
+
+          terraform init -input=false -reconfigure -lockfile=readonly -no-color
+          if ($LASTEXITCODE -ne 0) { throw 'terraform init failed.' }
+
+          # Refuse an unexpectedly empty established production backend. Set the
+          # opt-in metadata flag only for the first production deployment.
+          if ($env:TARGET_ENVIRONMENT -eq 'prd') {
+              terraform state pull *> $null
+              if ($LASTEXITCODE -ne 0 -and $env:ALLOW_EMPTY_PRODUCTION_STATE -ne 'true') {
+                  throw 'Production state could not be read. Refusing to continue.'
+              }
+          }
+
+          if ($env:TERRAFORM_ACTION -eq 'plan') {
+              terraform plan -input=false -lock=true -lock-timeout=5m -out=$env:TERRAFORM_PLAN_FILE -no-color
+              if ($LASTEXITCODE -ne 0) { throw 'terraform plan failed.' }
+
+              $hash = (Get-FileHash -LiteralPath $env:TERRAFORM_PLAN_FILE -Algorithm SHA256).Hash.ToLowerInvariant()
+              Set-Content -LiteralPath "$env:TERRAFORM_PLAN_FILE.sha256" -Value $hash -Encoding ascii
+              @{
+                  commit = $env:BUILDKITE_COMMIT
+                  environment = $env:TARGET_ENVIRONMENT
+                  state_id = $env:TERRAFORM_STATE_ID
+                  created_at = [DateTimeOffset]::UtcNow.ToString('o')
+                  terraform_version = (terraform version -json | ConvertFrom-Json).terraform_version
+                  build_url = $env:BUILDKITE_BUILD_URL
+              } | ConvertTo-Json | Set-Content -LiteralPath "$env:TERRAFORM_PLAN_FILE.manifest.json" -Encoding utf8
+          }
+          else {
+              terraform apply -input=false -lock=true -lock-timeout=5m -auto-approve $env:TERRAFORM_PLAN_FILE
+              if ($LASTEXITCODE -ne 0) { throw 'terraform apply failed.' }
+
+              # Post-apply convergence: exit 0 means no residual changes.
+              terraform plan -input=false -lock=true -lock-timeout=5m -detailed-exitcode -no-color
+              $convergenceExitCode = $LASTEXITCODE
+              if ($convergenceExitCode -eq 2) { throw 'Post-apply plan detected residual changes or drift.' }
+              if ($convergenceExitCode -ne 0) { throw 'Post-apply convergence check failed.' }
+          }
+      }
+      finally {
+          if (-not [string]::IsNullOrWhiteSpace($vaultToken)) {
+              try {
+                  Invoke-RestMethod `
+                      -Uri "$vaultAddress/v1/auth/token/revoke-self" `
+                      -Method POST `
+                      -Headers @{ 'X-Vault-Namespace' = $env:VAULT_NAMESPACE; 'X-Vault-Token' = $vaultToken } `
+                      -ErrorAction Stop | Out-Null
+              }
+              catch { Write-Warning 'Vault token revocation failed; its short TTL will expire.' }
+          }
+          @(
+              'TF_HTTP_ADDRESS', 'TF_HTTP_LOCK_ADDRESS', 'TF_HTTP_UNLOCK_ADDRESS',
+              'TF_HTTP_LOCK_METHOD', 'TF_HTTP_UNLOCK_METHOD', 'TF_HTTP_USERNAME',
+              'TF_HTTP_PASSWORD', 'TF_HTTP_RETRY_MAX', 'TF_HTTP_RETRY_WAIT_MIN',
+              'TF_HTTP_RETRY_WAIT_MAX', 'TF_DATA_DIR'
+          ) | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue }
+          $oidcToken = $null
+          $vaultToken = $null
+          $backendUsername = $null
+          $backendPassword = $null
+          if ($dataDir -and (Test-Path -LiteralPath $dataDir)) {
+              Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      }
+    artifact_paths:
+      - "tfplan-dev"
+      - "tfplan-dev.sha256"
+      - "tfplan-dev.manifest.json"
+    agents:
+      queue: "windows-terraform-dev"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/dev"
+    timeout_in_minutes: 30
+
+  - block: ":lock: Approve dev"
+    key: "approve-dev"
+    depends_on: "plan-dev"
+    prompt: "Review and apply the exact saved dev plan?"
+    branches: "main"
+
+  - label: ":terraform: Apply dev"
+    key: "apply-dev"
+    depends_on: "approve-dev"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "dev"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-dev"
+      TERRAFORM_ACTION: "apply"
+      TERRAFORM_PLAN_FILE: "tfplan-dev"
+      PRODUCING_PLAN_STEP: "plan-dev"
+    command: *terraform_runner
+    agents:
+      queue: "windows-terraform-dev"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/dev"
+    timeout_in_minutes: 60
+
+  - label: ":terraform: Plan stg"
+    key: "plan-stg"
+    depends_on: "apply-dev"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "stg"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-stg"
+      TERRAFORM_ACTION: "plan"
+      TERRAFORM_PLAN_FILE: "tfplan-stg"
+      PRODUCING_PLAN_STEP: "plan-stg"
+    command: *terraform_runner
+    artifact_paths:
+      - "tfplan-stg"
+      - "tfplan-stg.sha256"
+      - "tfplan-stg.manifest.json"
+    agents:
+      queue: "windows-terraform-stg"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/stg"
+    timeout_in_minutes: 30
+
+  - block: ":lock: Approve staging"
+    key: "approve-stg"
+    depends_on: "plan-stg"
+    prompt: "Review and apply the exact saved staging plan?"
+    branches: "main"
+
+  - label: ":terraform: Apply stg"
+    key: "apply-stg"
+    depends_on: "approve-stg"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "stg"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-stg"
+      TERRAFORM_ACTION: "apply"
+      TERRAFORM_PLAN_FILE: "tfplan-stg"
+      PRODUCING_PLAN_STEP: "plan-stg"
+    command: *terraform_runner
+    agents:
+      queue: "windows-terraform-stg"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/stg"
+    timeout_in_minutes: 60
+
+  - label: ":terraform: Plan production"
+    key: "plan-prd"
+    depends_on: "apply-stg"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "prd"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-prd"
+      TERRAFORM_ACTION: "plan"
+      TERRAFORM_PLAN_FILE: "tfplan-prd"
+      PRODUCING_PLAN_STEP: "plan-prd"
+    command: *terraform_runner
+    artifact_paths:
+      - "tfplan-prd"
+      - "tfplan-prd.sha256"
+      - "tfplan-prd.manifest.json"
+    agents:
+      queue: "windows-terraform-prd"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/prd"
+    timeout_in_minutes: 30
+
+  - block: ":lock: Approve production"
+    key: "approve-prd"
+    depends_on: "plan-prd"
+    prompt: "Review and apply the exact saved production plan?"
+    branches: "main"
+    fields:
+      - text: "Change/approval reference"
+        key: "change-reference"
+        required: true
+
+  - label: ":terraform: Apply production"
+    key: "apply-prd"
+    depends_on: "approve-prd"
+    branches: "main"
+    env:
+      TARGET_ENVIRONMENT: "prd"
+      VAULT_AUTH_ROLE: "tf-backend-octopusdeploy-prd"
+      TERRAFORM_ACTION: "apply"
+      TERRAFORM_PLAN_FILE: "tfplan-prd"
+      PRODUCING_PLAN_STEP: "plan-prd"
+    command: *terraform_runner
+    agents:
+      queue: "windows-terraform-prd"
+    concurrency: 1
+    concurrency_group: "terraform/octopusdeploy/prd"
+    timeout_in_minutes: 60
